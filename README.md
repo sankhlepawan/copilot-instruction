@@ -78,3 +78,7 @@ Copilot inline suggestions plus a single consolidated pipeline review.
 - Official docs: <https://docs.github.com/copilot/customizing-copilot/adding-custom-instructions-for-github-copilot>
 - Tutorial on effective instructions: <https://docs.github.com/copilot/tutorials/customize-code-review>
 - Community examples: <https://github.com/github/awesome-copilot>
+
+
+- learning
+https://dev.to/vevarunsharma/injecting-ai-agents-into-cicd-using-github-copilot-cli-in-github-actions-for-smart-failures-58m8
