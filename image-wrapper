@@ -1,0 +1,454 @@
+# Container Image Build Wrapper — Design & Implementation Guide
+
+**Status:** Draft v1.0
+**Owner:** Platform / DevOps team
+**Audience:** Platform engineers implementing the wrapper; app teams consuming it
+**Context:** Migration off Kaniko (archived Jan 2025). Current backend: Docker BuildKit (`docker buildx`). The wrapper exists so the backend can be replaced again in the future without touching application pipelines.
+
+---
+
+## 1. Goal and Principles
+
+### 1.1 Problem
+
+Today, every project pipeline calls the build tool directly. When the tool changes (Kaniko → BuildKit → whatever comes next), every repository must be edited, tested, and re-released. That is organization-wide technical debt.
+
+### 1.2 Solution
+
+Introduce a **build contract** owned by the platform team:
+
+> "Given a build context and an image name, produce an OCI image in the registry and report its digest."
+
+Application pipelines depend only on this contract. The tool that fulfills it (today BuildKit) is an internal implementation detail, hidden behind:
+
+1. A **wrapper script** (`build-image.sh`) — the only place that knows buildx flags.
+2. A **versioned builder image** that packages the script and its tooling.
+3. A **shared CI template** that projects include — the only thing project pipelines reference.
+
+A future tool swap = change in **one repository**, rolled out by a version bump.
+
+### 1.3 Design principles
+
+| Principle | Meaning |
+|---|---|
+| Contract over tool | Inputs/outputs are named after build *needs* (tags, args, platforms), never after tool flags. |
+| No escape hatches | No `EXTRA_BUILDX_FLAGS`-style passthrough. New needs become new named inputs. |
+| OCI is the boundary | The wrapper's only promise is a standard OCI image + digest. Every realistic future builder can fulfill it. |
+| Versioned contract | Builder image is semver'd. Projects pin a major version. |
+| Tested contract | A sample app in the wrapper repo proves the contract on every change. |
+
+---
+
+## 2. Architecture Overview
+
+```
+┌─────────────────────────────┐
+│ App repo pipeline           │   includes template, sets variables only
+│  IMAGE_NAME, BUILD_ARGS ... │
+└──────────────┬──────────────┘
+               │ include (pinned ref v1)
+┌──────────────▼──────────────┐
+│ ci-templates repo           │   .build-image job definition
+│  templates/build-image.yml  │
+└──────────────┬──────────────┘
+               │ uses image (pinned :1)
+┌──────────────▼──────────────┐
+│ image-builder repo          │   build-image.sh + Dockerfile + tests
+│  → registry/.../builder:1.x │
+└──────────────┬──────────────┘
+               │ internal detail (replaceable)
+┌──────────────▼──────────────┐
+│ Backend: BuildKit (today)   │   rootless buildkitd / buildx
+└─────────────────────────────┘
+```
+
+Three repositories / artifacts:
+
+| Repo | Contains | Consumed as |
+|---|---|---|
+| `platform/image-builder` | wrapper script, builder Dockerfile, contract tests | container image `registry.company.com/platform/image-builder:<ver>` |
+| `platform/ci-templates` | shared GitLab CI job templates | `include:` with pinned `ref:` |
+| App repos | only variables + `extends:` | — |
+
+---
+
+## 3. The Build Contract (v1)
+
+### 3.1 Inputs (environment variables)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `IMAGE_NAME` | yes | — | Full image repo, e.g. `registry.company.com/team/app`. No tag. |
+| `IMAGE_TAGS` | no | `$CI_COMMIT_SHA` | Space-separated tags, e.g. `"1.4.0 latest"`. |
+| `DOCKERFILE` | no | `Dockerfile` | Path relative to context. |
+| `BUILD_CONTEXT` | no | `.` | Build context directory. |
+| `BUILD_ARGS` | no | empty | Space-separated `KEY=VALUE` pairs. |
+| `BUILD_SECRETS` | no | empty | Space-separated `id=path` pairs, mounted as build secrets (never baked into layers). |
+| `PLATFORMS` | no | `linux/amd64` | Comma-separated, e.g. `linux/amd64,linux/arm64`. |
+| `CACHE_REF` | no | `$IMAGE_NAME:buildcache` | Registry ref used for layer cache. |
+| `PUSH` | no | `true` | `false` = build only (PR validation builds). |
+| `LABELS` | no | empty | Space-separated `KEY=VALUE` OCI labels. |
+| `TARGET` | no | empty | Multi-stage build target stage. |
+
+### 3.2 Outputs
+
+| Artifact | Description |
+|---|---|
+| Pushed image(s) | `$IMAGE_NAME:<tag>` for every tag in `IMAGE_TAGS` (when `PUSH=true`). |
+| `image.digest` | File in the job workspace containing the image digest (`sha256:...`). Downstream jobs (deploy, sign, scan) consume this — never re-resolve tags. |
+| `image.ref` | File containing the full pinned reference `IMAGE_NAME@sha256:...`. |
+
+### 3.3 Guarantees
+
+- Output is a standard OCI image, pullable by any runtime.
+- Registry-based layer caching across ephemeral runners (Kaniko `--cache-repo` equivalent).
+- Build secrets never persist in image layers.
+- Exit code non-zero on any failure; partial pushes are not treated as success.
+
+### 3.4 Explicit non-goals
+
+- No passthrough of raw builder flags.
+- No promise about *how* the image is built (daemon, rootless, remote builder). Pipelines must not assume a Docker socket exists.
+
+---
+
+## 4. Repository 1: `platform/image-builder`
+
+### 4.1 Layout
+
+```
+image-builder/
+├── Dockerfile              # the builder image itself
+├── bin/
+│   └── build-image.sh      # the wrapper (the ONLY place that knows buildx)
+├── tests/
+│   ├── sample-app/         # tiny app used by contract tests
+│   │   ├── Dockerfile
+│   │   └── main.go
+│   └── contract-test.sh
+├── .gitlab-ci.yml          # builds, tests, and releases the builder image
+├── CHANGELOG.md
+└── README.md               # contract documentation for consumers
+```
+
+### 4.2 `bin/build-image.sh`
+
+```bash
+#!/usr/bin/env bash
+# build-image.sh — org-standard container image build (contract v1)
+# Backend: BuildKit via docker buildx. This file is the ONLY place
+# allowed to reference buildx. See README.md for the contract.
+set -euo pipefail
+
+# ---------- contract inputs ----------
+: "${IMAGE_NAME:?IMAGE_NAME is required (e.g. registry.company.com/team/app)}"
+IMAGE_TAGS=${IMAGE_TAGS:-${CI_COMMIT_SHA:?IMAGE_TAGS or CI_COMMIT_SHA required}}
+DOCKERFILE=${DOCKERFILE:-Dockerfile}
+BUILD_CONTEXT=${BUILD_CONTEXT:-.}
+BUILD_ARGS=${BUILD_ARGS:-}
+BUILD_SECRETS=${BUILD_SECRETS:-}
+PLATFORMS=${PLATFORMS:-linux/amd64}
+CACHE_REF=${CACHE_REF:-${IMAGE_NAME}:buildcache}
+PUSH=${PUSH:-true}
+LABELS=${LABELS:-}
+TARGET=${TARGET:-}
+
+# ---------- assemble flags ----------
+flags=()
+
+for t in $IMAGE_TAGS;     do flags+=(-t "${IMAGE_NAME}:${t}"); done
+for a in $BUILD_ARGS;     do flags+=(--build-arg "$a"); done
+for s in $BUILD_SECRETS;  do flags+=(--secret "id=${s%%=*},src=${s#*=}"); done
+for l in $LABELS;         do flags+=(--label "$l"); done
+[ -n "$TARGET" ] && flags+=(--target "$TARGET")
+
+flags+=(-f "$DOCKERFILE")
+flags+=(--platform "$PLATFORMS")
+flags+=(--cache-from "type=registry,ref=${CACHE_REF}")
+flags+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,image-manifest=true")
+flags+=(--provenance=false)   # flip to true once registry + consumers support attestations
+
+if [ "$PUSH" = "true" ]; then
+  flags+=(--push)
+else
+  # still produce an image archive so PUSH=false builds are verifiable
+  flags+=(--output "type=oci,dest=/tmp/image.oci")
+fi
+
+meta=/tmp/build-meta.json
+flags+=(--metadata-file "$meta")
+
+# ---------- ensure builder exists ----------
+# BUILDKIT_ADDR is set by the CI template when using a remote/rootless buildkitd.
+if [ -n "${BUILDKIT_ADDR:-}" ]; then
+  docker buildx create --name ci --driver remote "$BUILDKIT_ADDR" >/dev/null 2>&1 || true
+  docker buildx use ci
+fi
+
+echo ">> build-image (contract v1, backend: buildkit)"
+echo ">> image=${IMAGE_NAME} tags=[${IMAGE_TAGS}] platforms=${PLATFORMS} push=${PUSH}"
+
+docker buildx build "${flags[@]}" "$BUILD_CONTEXT"
+
+# ---------- contract outputs ----------
+if [ "$PUSH" = "true" ]; then
+  digest=$(jq -r '."containerimage.digest"' "$meta")
+  [ -n "$digest" ] && [ "$digest" != "null" ] || { echo "ERROR: no digest in metadata"; exit 1; }
+  echo "$digest" > image.digest
+  echo "${IMAGE_NAME}@${digest}" > image.ref
+  echo ">> pushed ${IMAGE_NAME}@${digest}"
+fi
+```
+
+Notes:
+
+- `--metadata-file` + `jq` produces the digest without re-querying the registry.
+- `BUILDKIT_ADDR` keeps the script identical whether the runner has a local daemon or talks to a remote rootless `buildkitd` (Kubernetes case, §7).
+- Registry login is handled by the CI template before the script runs (§5), keeping auth concerns out of the contract.
+
+### 4.3 `Dockerfile` (the builder image)
+
+```dockerfile
+FROM docker:27-cli
+
+RUN apk add --no-cache bash jq curl git \
+ && mkdir -p /usr/lib/docker/cli-plugins \
+ && BUILDX_VER=v0.21.2 \
+ && curl -fsSL -o /usr/lib/docker/cli-plugins/docker-buildx \
+      "https://github.com/docker/buildx/releases/download/${BUILDX_VER}/buildx-${BUILDX_VER}.linux-amd64" \
+ && chmod +x /usr/lib/docker/cli-plugins/docker-buildx
+
+COPY bin/build-image.sh /usr/local/bin/build-image.sh
+RUN chmod +x /usr/local/bin/build-image.sh
+
+ENTRYPOINT []
+CMD ["build-image.sh"]
+```
+
+### 4.4 Versioning & release rules
+
+Semantic versioning of the **contract**, published as image tags `X.Y.Z`, `X.Y`, and `X` (moving):
+
+| Change | Bump |
+|---|---|
+| New optional input / output | minor |
+| Bug fix, backend upgrade with identical behavior | patch |
+| Removed/renamed input, changed default, changed output format | **major** |
+| **Swapping the backend tool** while honoring the contract | minor or patch ✅ |
+
+That last row is the whole point: replacing BuildKit later is *not* a breaking change for consumers if the contract holds.
+
+Release flow in `image-builder/.gitlab-ci.yml`: build image → run contract tests (§8) → on git tag `vX.Y.Z`, push `:X.Y.Z`, retag `:X.Y` and `:X`.
+
+---
+
+## 5. Repository 2: `platform/ci-templates`
+
+### 5.1 `templates/build-image.yml`
+
+```yaml
+# Org-standard image build job. App pipelines extend this and set variables.
+# Contract docs: platform/image-builder/README.md
+
+.build-image:
+  image: registry.company.com/platform/image-builder:1   # pinned MAJOR
+  variables:
+    # remote rootless buildkitd (Kubernetes runners), see infra docs §7
+    BUILDKIT_ADDR: "tcp://buildkitd.ci-build.svc.cluster.local:1234"
+  before_script:
+    # registry auth — the one infra concern handled here, not in app repos
+    - mkdir -p ~/.docker
+    - >
+      echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w0)\"}}}"
+      > ~/.docker/config.json
+  script:
+    - build-image.sh
+  artifacts:
+    paths: [image.digest, image.ref]
+    expire_in: 1 week
+```
+
+Pin the template repo itself with a `ref:` when including (next section), so template changes also roll out deliberately.
+
+### 5.2 What an application pipeline looks like
+
+```yaml
+include:
+  - project: platform/ci-templates
+    ref: v1                       # pinned template version
+    file: templates/build-image.yml
+
+build:
+  extends: .build-image
+  stage: build
+  variables:
+    IMAGE_NAME: $CI_REGISTRY_IMAGE
+    IMAGE_TAGS: "$CI_COMMIT_SHA latest"
+    BUILD_ARGS: "APP_VERSION=$CI_COMMIT_SHA"
+
+# downstream example — consumes the contract output, never the tool
+deploy:
+  stage: deploy
+  needs: [build]
+  script:
+    - IMAGE_REF=$(cat image.ref)
+    - helm upgrade myapp ./chart --set image.ref=$IMAGE_REF
+```
+
+**This is the entire surface area an app team ever sees.** No buildx, no Kaniko, no daemon details.
+
+---
+
+## 6. Rules That Keep the Abstraction From Leaking
+
+1. **No raw-flag passthrough.** The moment `EXTRA_FLAGS` exists, teams couple to the backend again. New capability → new named input → minor release.
+2. **Downstream jobs consume `image.digest` / `image.ref` only.** Never `docker inspect`, never tag re-resolution.
+3. **Pipelines must not assume a Docker socket.** The backend may be remote/rootless. Anything needing `docker run` for tests is a separate concern, not this contract.
+4. **Dockerfiles stay portable.** Standard Dockerfile syntax only; backend-specific syntax extensions are allowed only if the contract README documents them as supported (they then become part of the contract).
+5. **Auth lives in the template**, not in app repos and not in the contract.
+6. **Lint it.** Add a CI policy check (e.g. simple grep in a compliance job, or Danger/conftest rule) that flags `docker build`, `buildx`, `kaniko`, or `executor` appearing in app `.gitlab-ci.yml` files.
+
+---
+
+## 7. Backend Setup: Rootless BuildKit on Kubernetes Runners
+
+(Skip this section if runners are VMs with a local Docker daemon — the same wrapper works unchanged because `BUILDKIT_ADDR` is simply unset.)
+
+Deploy a shared rootless `buildkitd` in the cluster:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: ci-build
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: buildkitd } }
+  template:
+    metadata:
+      labels: { app: buildkitd }
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/buildkitd: unconfined
+    spec:
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:v0.20.2-rootless
+          args:
+            - --addr=tcp://0.0.0.0:1234
+            - --oci-worker-no-process-sandbox
+          securityContext:
+            seccompProfile: { type: Unconfined }
+            runAsUser: 1000
+            runAsGroup: 1000
+          readinessProbe:
+            exec: { command: ["buildctl", "debug", "workers"] }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: ci-build
+spec:
+  selector: { app: buildkitd }
+  ports: [{ port: 1234, targetPort: 1234 }]
+```
+
+Hardening to add before production: mTLS between jobs and buildkitd (`--tlscacert/--tlscert/--tlskey` on both sides), a NetworkPolicy restricting ingress to runner pods, and resource quotas. Alternative topology: per-job buildkitd sidecar (stronger isolation, no shared local cache — registry cache still works).
+
+The CI template's `BUILDKIT_ADDR` points at this Service; the wrapper script needs no change either way. **This deployment is also an implementation detail** — replacing it later doesn't touch the contract.
+
+---
+
+## 8. Contract Tests (the safety net for future swaps)
+
+`tests/contract-test.sh` runs in the `image-builder` repo's own pipeline on every MR:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+TEST_IMAGE="${CI_REGISTRY_IMAGE}/contract-test"
+
+# 1. basic build + push produces digest outputs
+IMAGE_NAME=$TEST_IMAGE IMAGE_TAGS=$CI_COMMIT_SHA \
+  BUILD_CONTEXT=tests/sample-app build-image.sh
+test -s image.digest && grep -q '^sha256:' image.digest
+test -s image.ref
+
+# 2. image is pullable by digest
+crane manifest "$(cat image.ref)" >/dev/null
+
+# 3. build args are applied
+IMAGE_NAME=$TEST_IMAGE IMAGE_TAGS=args-$CI_COMMIT_SHA \
+  BUILD_ARGS="GREETING=hello" BUILD_CONTEXT=tests/sample-app build-image.sh
+crane config "$TEST_IMAGE:args-$CI_COMMIT_SHA" | jq -e '.config.Env | index("GREETING=hello")'
+
+# 4. second build hits cache (heuristic: completes much faster / logs CACHED)
+start=$(date +%s)
+IMAGE_NAME=$TEST_IMAGE IMAGE_TAGS=cache-$CI_COMMIT_SHA \
+  BUILD_CONTEXT=tests/sample-app build-image.sh
+echo "cached build took $(( $(date +%s) - start ))s"
+
+# 5. PUSH=false does not push
+PUSH=false IMAGE_NAME=$TEST_IMAGE IMAGE_TAGS=nopush \
+  BUILD_CONTEXT=tests/sample-app build-image.sh
+! crane manifest "$TEST_IMAGE:nopush" >/dev/null 2>&1
+
+echo "contract v1: ALL TESTS PASSED"
+```
+
+When you swap the backend in the future: green contract tests on the new implementation = consumers are safe.
+
+---
+
+## 9. Rollout Plan (Kaniko → wrapper)
+
+| Phase | Action | Exit criteria |
+|---|---|---|
+| 1 | Build `image-builder` repo, deploy buildkitd, pass contract tests | `:1.0.0` released |
+| 2 | Publish `ci-templates` `v1`; migrate 2–3 pilot projects | Pilot builds green for 1 week; cache hit rates ≥ Kaniko baseline |
+| 3 | Org-wide migration (mechanical: replace Kaniko job with `extends: .build-image`) | Mapping cheat-sheet: `--destination` → `IMAGE_NAME`/`IMAGE_TAGS`; `--cache-repo` → `CACHE_REF`; `--build-arg` → `BUILD_ARGS`; `--dockerfile` → `DOCKERFILE`; `--no-push` → `PUSH=false` |
+| 4 | Add CI policy check forbidding direct tool usage | No direct `buildx`/`kaniko` references in app repos |
+
+Expect a one-time full cache rebuild per project (BuildKit layer digests differ from Kaniko's), and re-pin anything that pinned Kaniko-built digests.
+
+## 10. Future Tool-Swap Playbook
+
+When BuildKit's successor arrives:
+
+1. Branch in `image-builder`; rewrite *only* the backend section of `build-image.sh`.
+2. Contract tests must pass unchanged.
+3. Release `:1.(Y+1).0` as `:1-rc`; point 2–3 volunteer projects' template variable at the RC.
+4. Bake for a week, then retag as `:1`. **Zero app-repo changes.**
+5. Only if the new tool forces a contract change → major version `:2`, with `:1` maintained during a deprecation window.
+
+---
+
+## Appendix A: Other CI systems (same contract)
+
+**GitHub Actions** — wrap as a composite action in a central repo:
+
+```yaml
+# org/.github/actions/build-image/action.yml
+runs:
+  using: docker
+  image: docker://registry.company.com/platform/image-builder:1
+```
+
+**Jenkins** — shared library step:
+
+```groovy
+def call(Map cfg) {
+  docker.image('registry.company.com/platform/image-builder:1').inside {
+    withEnv(["IMAGE_NAME=${cfg.imageName}", "IMAGE_TAGS=${cfg.tags ?: env.GIT_COMMIT}"]) {
+      sh 'build-image.sh'
+    }
+  }
+}
+// usage in Jenkinsfile:  buildImage(imageName: 'registry.company.com/team/app')
+```
+
+The builder image and contract are shared across all CI systems; only the thin template layer is per-system.
